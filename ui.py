@@ -5,9 +5,10 @@ import os
 import re
 import psutil
 import threading
-from pygame.locals import *
+import socket
 import time
 import simcube
+from pygame.locals import *
 
 
 class Ui:
@@ -41,7 +42,7 @@ class Ui:
         97: (255, 255, 255)
         }
 
-        self.ANSI_REGEX = re.compile(r"\033\[(\d+)m")
+        self.ANSI_REGEX = re.compile(r'\033\[(\d+)(;\d+)*m')
         pygame.init()
         if not fullscreen:
             self.screen = pygame.display.set_mode(self.dimensions)
@@ -62,37 +63,63 @@ class Ui:
 
     
 
-    def parse_ansi(self,text):
+    def parse_ansi(self, text, initial_color):
         segments = []
         last_pos = 0
-        current_color = (255, 255, 255)
-        for match in self.ANSI_REGEX.finditer(text):
-            start, end = match.span()
-            code = int(match.group(1))
-            if start > last_pos:
-                segments.append((text[last_pos:start], current_color))
-            if code == 0:
-                current_color = (255, 255, 255)  # reset
-            elif code in self.ANSI_COLORS:
-                current_color = self.ANSI_COLORS[code]
-            last_pos = end
+        current_color = initial_color
+        
+        i = 0
+        while i < len(text):
+            if text[i:i+2] == '\033[':
+                if last_pos < i:
+                    segments.append((text[last_pos:i], current_color))
+                end = text.find('m', i)
+                if end == -1:
+                    break
+                codes = text[i+2:end].split(';')
+                for code in codes:
+                    if code.isdigit():
+                        code_num = int(code)
+                        if code_num == 0:
+                            current_color = self.font_color
+                        elif code_num in self.ANSI_COLORS:
+                            current_color = self.ANSI_COLORS[code_num]
+                last_pos = end + 1
+                i = last_pos
+            else:
+                i += 1
+
         if last_pos < len(text):
             segments.append((text[last_pos:], current_color))
-        return segments
+            
+        return segments, current_color
 
-    def print_text(self, text: str, font_name: str, size: int, position: tuple):
+    def print_text(self, text: str, font_name: str, size: int, position: tuple, initial_color=None):
         font = pygame.font.SysFont(font_name, size)
         x, y = position
-        for segment, seg_color in self.parse_ansi(text):
-            surface = font.render(segment, False, seg_color)
-            self.screen.blit(surface, (x, y))
-            x += surface.get_width()
+        if initial_color is None:
+            initial_color = self.font_color
+
+        segments, last_color = self.parse_ansi(text, initial_color)
+        
+        for segment, seg_color in segments:
+            if not segment:
+                continue
+            clean_segment = re.sub(r'\033\[\d*[a-zA-Z]', '', segment)
+            if clean_segment:
+                surface = font.render(clean_segment, True, seg_color)
+                self.screen.blit(surface, (x, y))
+                x += surface.get_width()
+        
+        return last_color  # retourne la dernière couleur utilisée
+
 
     def event_handler(self):
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 self.running = False
             if event.type == pygame.KEYDOWN:
+                subprocess.run("DISPLAY=:0 xdotool key shift",shell=True)
                 if event.key == pygame.K_UP:
                     self.menu.up()
                 if event.key == pygame.K_DOWN:
@@ -103,41 +130,52 @@ class Ui:
                     self.menu.right()
 
     def keyboard_event_handler(self):
+        self.scroll_pos = 0
+        self.end_loop = None
         while self.running:
-            i = input()
-            if i == "u":
-                pygame.event.post(pygame.event.Event(KEYDOWN, key=K_UP))
-            elif i == "d":
-                pygame.event.post(pygame.event.Event(KEYDOWN, key=K_DOWN))
-            elif i == "l":
-                pygame.event.post(pygame.event.Event(KEYDOWN, key=K_LEFT))
-            elif i == "r":
-                pygame.event.post(pygame.event.Event(KEYDOWN, key=K_RIGHT))
+            inpt = input()
+            for i in inpt:
+                if i == "u":
+                    pygame.event.post(pygame.event.Event(KEYDOWN, key=K_UP))
+                    self.scroll_pos+=4
+                elif i == "d":
+                    pygame.event.post(pygame.event.Event(KEYDOWN, key=K_DOWN))
+                    self.scroll_pos-=4
+                elif i == "l":
+                    pygame.event.post(pygame.event.Event(KEYDOWN, key=K_LEFT))
+                    self.end_loop = True
+                elif i == "r":
+                    pygame.event.post(pygame.event.Event(KEYDOWN, key=K_RIGHT))
 
     def render(self, menu):
         if menu.title.startswith("<DOn>"):
-            end_loop = False
+            self.end_loop = False
             func = globals().get(menu.title[5:])
+            print(func)
             results = func().split("\n")
-            pix_per_letter = math.floor((self.dimensions[0] / max([len(i) for i in results])) / 0.6)
-            temp_font = pygame.font.SysFont(self.font_name, pix_per_letter)
-            scroll_pos = 0
-            while not end_loop:
+            pix_per_letter = math.floor((self.dimensions[0] / max([len(re.sub(r'\x1B\[[0-9;]*[a-zA-Z]', '', i)) for i in results])) / 0.6)
+            self.scroll_pos = 0
+            while not self.end_loop:
+                
                 for event in pygame.event.get():
                     if event.type == pygame.QUIT:
                         self.running = False
-                        end_loop = True
-                keys = pygame.key.get_pressed()
-                if keys[pygame.K_LEFT]:
-                    end_loop = True
+                        self.end_loop = True
+                self.keys = pygame.key.get_pressed()
+                if self.keys[pygame.K_LEFT]:
+                    self.end_loop = True
                     self.menu.left()
-                if keys[pygame.K_UP] and scroll_pos < 0:
-                    scroll_pos += 2
-                if keys[pygame.K_DOWN]:
-                    scroll_pos -= 2
+                if self.keys[pygame.K_UP] and self.scroll_pos < 0:
+                    self.scroll_pos += 2
+                if self.keys[pygame.K_DOWN]:
+                    self.scroll_pos -= 2
+
                 self.screen.fill(self.bg_color)
+                color = self.font_color
                 for i, result in enumerate(results):
-                    self.print_text(result,self.font_name,pix_per_letter,(5, (pix_per_letter) * i + scroll_pos))
+                    y = (pix_per_letter) * i + self.scroll_pos
+                    color = self.print_text(result, self.font_name, pix_per_letter, (5, y), color)
+
                 pygame.display.flip()
                 self.clock.tick(self.fps)
 
@@ -233,7 +271,8 @@ menu = Case("Tools", [
         Case("<DOn>neofetch", []),
         Case("<DOn>ifconfig", []),
         Case("<DOa>resource_monitor", []),
-        Case("<DOa>benchmark", [])
+        Case("<DOa>benchmark", []),
+        Case("<DOa>updates", [])
     ])
 ])
 
@@ -265,24 +304,39 @@ def benchmark(screen,back_clolr,font_str,dimention):
                 if event.key == pygame.K_LEFT:
                     end = True
     cube = None
+
+def is_connected(host="8.8.8.8", port=53, timeout=3):
+    try:
+        socket.setdefaulttimeout(timeout)
+        socket.socket(socket.AF_INET, socket.SOCK_STREAM).connect((host, port))
+        return True
+    except OSError:
+        return False
+    
+
 if os.name == 'nt':
     def neofetch():
-        command = [
+        a =subprocess.run([
             "powershell", 
-            "-ExecutionPolicy", "Bypass",
             "-Command", 
-            "Invoke-Expression -Command \"& 'C:\\Program Files\\WindowsPowerShell\\Scripts\\winfetch.ps1'\""
-        ]
-        result = subprocess.run(command, capture_output=True, text=True)
-        return result.stdout
+            "& 'C:\\Program Files\\WindowsPowerShell\\Scripts\\winfetch.ps1'"
+        ], capture_output=True, text=True)
+        return a.stdout
     Ui((320, 240), 60, menu)
+    def ifconfig():
+        return "Not aviable on Windows"
+    def resource_monitor(screen,back_color,font_str,dim):
+        return "Not aviable on Windows"
+
 
 elif os.name == 'posix':
     os.environ['DISPLAY'] = ':0'
     def neofetch():
+        # Don't strip ANSI escape sequences here
         a = subprocess.run("neofetch", capture_output=True, text=True, encoding="utf-8")
-        ansi_escape = re.compile(r'\x1B\[[0-?]*[ -/]*[@-~]')
-        return ansi_escape.sub('', a.stdout)
+        # Remove specific ANSI sequences that control cursor position but keep color codes
+        output = re.sub(r'\x1B\[[0-9;]*[ABCDEFGJKST]', '', a.stdout)
+        return output
     def ifconfig():
         a = subprocess.run("ip -4 addr show wlan0 | grep inet", capture_output=True,shell=True, text=True, encoding="utf-8").stdout.split(" ")
         b = ""
@@ -319,9 +373,36 @@ elif os.name == 'posix':
                 text = font.render(result, False, (255, 255, 255))
                 screen.blit(text, (5, i*(line_space+10)))
             pygame.display.flip()
-    def install_dependancy():
-        subprocess.run("sudo apt install hcxdumptool",shell=True)
+    def updates(screen, back_color, font_str, dim):
+        font_size = 20
+        font = pygame.font.SysFont(font_str, font_size)
+        max_lines = dim[1] // (font_size + 5)
 
-    #install_dependancy()
+        process = subprocess.Popen(["sudo", "apt-get", "update", "-y"],
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT,
+                                universal_newlines=True)
 
-    Ui((320, 240), 60, menu,font="Monospace",fullscreen=True)
+        lines = []
+        while True:
+            output = process.stdout.readline()
+            if output == '' and process.poll() is not None:
+                break
+            if output:
+                lines.append(output.strip())
+                if len(lines) > max_lines:
+                    lines.pop(0)  # garde que les dernières lignes
+
+            screen.fill(back_color)
+            for i, content in enumerate(lines):
+                rendered = font.render(content, False, (255, 255, 255))
+                screen.blit(rendered, (5, i * (font_size + 5)))
+            pygame.display.flip()
+
+        screen.fill(back_color)
+        screen.blit(font.render("System will reboot now!", False, (255, 255, 255)), (5, 5))
+        pygame.display.flip()
+        time.sleep(2)
+        subprocess.run("sudo reboot", shell=True)
+
+    Ui((320, 240), 60, menu,font_name="Monospace",fullscreen=True)
